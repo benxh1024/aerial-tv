@@ -1,0 +1,224 @@
+name: Build Aerial for OPPO K9
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build OPPO K9 APK
+    runs-on: ubuntu-latest
+
+    env:
+      OPPO_PACKAGE: com.oneplus.tv.launcher2
+      MODERN_HOME_CATEGORY: com.heytap.tv.launcher.category.MODERN_HOME
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Patch package name and OPPO launcher category
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          old_package = "app.orchard.tv"
+          new_package = os.environ["OPPO_PACKAGE"]
+          modern_home_category = os.environ["MODERN_HOME_CATEGORY"]
+
+          excluded_dirs = {
+              ".git",
+              ".gradle",
+              ".idea",
+              "build",
+              "node_modules",
+          }
+
+          def is_source_file(path):
+              return not any(part in excluded_dirs for part in path.parts)
+
+          gradle_files = [
+              path
+              for path in Path(".").rglob("*")
+              if path.name in ("build.gradle", "build.gradle.kts")
+              and is_source_file(path)
+          ]
+
+          application_id_pattern = re.compile(
+              r'(\bapplicationId\s*(?:=\s*)?["\'])'
+              + re.escape(old_package)
+              + r'(["\'])'
+          )
+
+          patched_gradle_files = []
+
+          for path in gradle_files:
+              text = path.read_text(encoding="utf-8")
+              updated, replacements = application_id_pattern.subn(
+                  r"\1" + new_package + r"\2",
+                  text,
+              )
+
+              if replacements:
+                  path.write_text(updated, encoding="utf-8")
+                  patched_gradle_files.append(str(path))
+
+          if not patched_gradle_files:
+              raise SystemExit(
+                  "Could not find applicationId "
+                  + old_package
+                  + " in build.gradle or build.gradle.kts."
+              )
+
+          print("Changed applicationId in:")
+          for path in patched_gradle_files:
+              print("  " + path)
+
+          android_name = 'android:name="'
+          main_action = "android.intent.action.MAIN"
+          home_category = "android.intent.category.HOME"
+
+          manifest_files = [
+              path
+              for path in Path(".").rglob("AndroidManifest.xml")
+              if is_source_file(path)
+          ]
+
+          patched_manifests = []
+
+          for path in manifest_files:
+              text = path.read_text(encoding="utf-8")
+
+              if modern_home_category in text:
+                  continue
+
+              filters = re.findall(
+                  r"<intent-filter\b[^>]*>.*?</intent-filter>",
+                  text,
+                  flags=re.DOTALL,
+              )
+
+              updated_text = text
+              changed = False
+
+              for intent_filter in filters:
+                  if (
+                      main_action in intent_filter
+                      and home_category in intent_filter
+                  ):
+                      indentation_match = re.search(
+                          r"\n([ \t]*)<category\b",
+                          intent_filter,
+                      )
+                      indentation = (
+                          indentation_match.group(1)
+                          if indentation_match
+                          else "            "
+                      )
+
+                      category_line = (
+                          "\n"
+                          + indentation
+                          + '<category android:name="'
+                          + modern_home_category
+                          + '" />'
+                      )
+
+                      replacement = intent_filter.replace(
+                          "</intent-filter>",
+                          category_line + "\n        </intent-filter>",
+                          1,
+                      )
+
+                      updated_text = updated_text.replace(
+                          intent_filter,
+                          replacement,
+                          1,
+                      )
+                      changed = True
+                      break
+
+              if changed:
+                  path.write_text(updated_text, encoding="utf-8")
+                  patched_manifests.append(str(path))
+
+          if not patched_manifests:
+              raise SystemExit(
+                  "Could not find a MAIN + HOME intent-filter "
+                  "to add the OPPO MODERN_HOME category."
+              )
+
+          print("Added OPPO MODERN_HOME category in:")
+          for path in patched_manifests:
+              print("  " + path)
+          PY
+
+      - name: Build standard debug APK
+        run: ./gradlew assembleStandardDebug --stacktrace
+
+      - name: Find and verify APK
+        shell: bash
+        run: |
+          APK="$(find . \
+            -path '*/build/outputs/apk/standard/debug/*.apk' \
+            ! -name '*unaligned*' \
+            | head -n 1)"
+
+          test -n "$APK" || {
+            echo "Could not find the standard debug APK."
+            find . -path '*/build/outputs/apk/*' -type f -name '*.apk' -print
+            exit 1
+          }
+
+          mkdir -p artifact
+          cp "$APK" artifact/Aerial-oppo-k9-debug.apk
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort -V \
+            | tail -n 1)"
+
+          test -n "$BUILD_TOOLS" || {
+            echo "Android SDK Build Tools were not found."
+            exit 1
+          }
+
+          "$BUILD_TOOLS/apksigner" verify --verbose \
+            artifact/Aerial-oppo-k9-debug.apk
+
+          "$BUILD_TOOLS/aapt" dump badging \
+            artifact/Aerial-oppo-k9-debug.apk \
+            | grep "package: name='com.oneplus.tv.launcher2'"
+
+          "$BUILD_TOOLS/aapt" dump xmltree \
+            artifact/Aerial-oppo-k9-debug.apk \
+            AndroidManifest.xml \
+            | grep "com.heytap.tv.launcher.category.MODERN_HOME"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aerial-OPPO-K9-debug
+          path: artifact/Aerial-oppo-k9-debug.apk
+          if-no-files-found: error
+          retention-days: 30
